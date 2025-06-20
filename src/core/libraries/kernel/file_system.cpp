@@ -662,6 +662,7 @@ s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
         sb->st_size = 0;
         sb->st_blksize = 512;
         sb->st_blocks = 0;
+        sb->st_nlink = 2 + file->dirents.size(); // 2 for '.' and '...'
         // TODO incomplete
         break;
     }
@@ -878,6 +879,7 @@ static s32 GetDents(s32 fd, char* buf, s32 nbytes, s64* basep) {
         *__Error() = POSIX_EBADF;
         return -1;
     }
+    LOG_INFO(Kernel_Fs, "GetDents fd = {} path = {}", fd, file->m_guest_name);
     if (file->type == Core::FileSys::FileType::Device) {
         s32 result = file->device->getdents(buf, nbytes, basep);
         if (result < 0) {
@@ -888,6 +890,7 @@ static s32 GetDents(s32 fd, char* buf, s32 nbytes, s64* basep) {
     }
 
     if (file->dirents_index == file->dirents.size()) {
+        LOG_INFO(Kernel_Fs, "GetDents no more entries. fd = {}", fd);
         return ORBIS_OK;
     }
     if (file->type != Core::FileSys::FileType::Directory || nbytes < 512 ||
@@ -895,23 +898,44 @@ static s32 GetDents(s32 fd, char* buf, s32 nbytes, s64* basep) {
         *__Error() = POSIX_EINVAL;
         return -1;
     }
-    const auto& entry = file->dirents.at(file->dirents_index++);
-    auto str = entry.name;
-    static int fileno = 1000; // random
-    OrbisKernelDirent* sce_ent = (OrbisKernelDirent*)buf;
-    sce_ent->d_fileno = fileno++; // TODO this should be unique but atm it changes maybe switch to a
-    // hash or something?
-    sce_ent->d_reclen = sizeof(OrbisKernelDirent);
-    sce_ent->d_type = (entry.isFile ? 8 : 4);
-    sce_ent->d_namlen = str.size();
-    strncpy(sce_ent->d_name, str.c_str(), ORBIS_MAX_PATH);
-    sce_ent->d_name[ORBIS_MAX_PATH] = '\0';
+
+    static int dummy_inode_number = 1000; // random
+    s32 buf_offset = 0;
+    s32 populated_file_count = 0;
+
+    while (file->dirents_index < file->dirents.size()) {
+        // we have more files
+        const auto& entry = file->dirents.at(file->dirents_index++);
+        auto& basename_str = entry.name;
+        // first, check if buffer is big enough for the next entry
+        s32 real_size = sizeof(OrbisKernelDirent) - ORBIS_MAX_PATH + basename_str.size();
+        if (buf_offset + real_size > nbytes) {
+            // not enough space for the next entry
+            file->dirents_index--; // restore index
+            break;
+        }
+        auto* sce_ent = (OrbisKernelDirent*)(buf + buf_offset);
+        // Fill in the dirent structure
+        sce_ent->d_fileno = dummy_inode_number++; // TODO this should be unique but atm it changes maybe switch to a
+        // hash or something?
+        sce_ent->d_reclen = real_size;
+        sce_ent->d_type = (entry.isFile ? 8 : 4); // 8: DT_REG, 4: DT_DIR
+        sce_ent->d_namlen = basename_str.size();
+        strncpy(sce_ent->d_name, basename_str.c_str(), sce_ent->d_namlen);
+        sce_ent->d_name[sce_ent->d_namlen] = '\0';
+
+        LOG_INFO(Kernel_Fs, "GetDents populating offset = {} ent_name = {} populated_file_count = {}",
+            buf_offset, basename_str, populated_file_count);
+
+        buf_offset += real_size;
+        populated_file_count++;
+    }
 
     if (basep != nullptr) {
         *basep = file->dirents_index;
     }
 
-    return sizeof(OrbisKernelDirent);
+    return buf_offset;
 }
 
 s32 PS4_SYSV_ABI posix_getdents(s32 fd, char* buf, s32 nbytes) {
